@@ -1,6 +1,7 @@
 from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageFilter, ImageEnhance, ImageOps
 import io
+import zipfile
 
 app = Flask(__name__)
 
@@ -8,6 +9,17 @@ FILTERS = [
     "grayscale", "vintage", "blur", "sharpen",
     "emboss", "invert", "edge_enhance", "contour",
 ]
+
+
+def _load_image(file_storage):
+    img = Image.open(file_storage.stream)
+    img.load()
+    img = img.copy()
+    return img
+
+
+def _apply_filter(img, filter_name):
+    return FILTER_MAP[filter_name](img.copy())
 
 
 def apply_grayscale(img):
@@ -66,9 +78,12 @@ FILTER_MAP = {
 def index():
     return jsonify({
         "service": "Image Filter Service",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "available_filters": FILTERS,
-        "usage": "POST /filter/<filter_name> with multipart form field 'image'",
+        "usage": {
+            "single": "POST /filter/<filter_name> with multipart form field 'image'",
+            "batch": "POST /batch with form fields 'image' and 'filters' (comma-separated)",
+        },
     })
 
 
@@ -87,12 +102,12 @@ def apply_filter(filter_name):
 
     file = request.files["image"]
     try:
-        img = Image.open(file.stream)
+        img = _load_image(file)
     except Exception:
         return jsonify({"error": "Invalid image file."}), 400
 
     try:
-        result = FILTER_MAP[filter_name](img)
+        result = _apply_filter(img, filter_name)
     except Exception as e:
         return jsonify({"error": f"Filter application failed: {str(e)}"}), 500
 
@@ -106,6 +121,47 @@ def apply_filter(filter_name):
 
     mime = {"JPEG": "image/jpeg", "PNG": "image/png", "BMP": "image/bmp", "GIF": "image/gif", "WEBP": "image/webp"}
     return send_file(buf, mimetype=mime.get(save_fmt, "image/png"))
+
+
+@app.route("/batch", methods=["POST"])
+def batch_filter():
+    if "image" not in request.files:
+        return jsonify({"error": "No image provided. Use form field 'image'."}), 400
+
+    filter_names = request.form.get("filters", "")
+    if not filter_names:
+        return jsonify({"error": "No filters specified. Use form field 'filters' (comma-separated)."}), 400
+
+    names = [n.strip() for n in filter_names.split(",") if n.strip()]
+    unknown = [n for n in names if n not in FILTER_MAP]
+    if unknown:
+        return jsonify({"error": f"Unknown filters: {unknown}", "available_filters": FILTERS}), 400
+
+    file = request.files["image"]
+    try:
+        img = _load_image(file)
+    except Exception:
+        return jsonify({"error": "Invalid image file."}), 400
+
+    fmt = img.format or "PNG"
+    save_fmt = fmt if fmt in ("JPEG", "PNG", "BMP", "GIF", "WEBP") else "PNG"
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in names:
+            try:
+                result = _apply_filter(img, name)
+                img_buf = io.BytesIO()
+                if save_fmt == "JPEG" and result.mode in ("RGBA", "LA", "P"):
+                    result = result.convert("RGB")
+                result.save(img_buf, format=save_fmt)
+                img_buf.seek(0)
+                zf.writestr(f"{name}.{save_fmt.lower()}", img_buf.read())
+            except Exception as e:
+                return jsonify({"error": f"Filter '{name}' failed: {str(e)}"}), 500
+
+    zip_buf.seek(0)
+    return send_file(zip_buf, mimetype="application/zip", as_attachment=True, download_name="filters.zip")
 
 
 if __name__ == "__main__":
